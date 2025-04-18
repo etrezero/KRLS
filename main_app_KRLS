@@ -1,0 +1,238 @@
+import pandas as pd
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import dash
+from dash import dcc, html, Input, Output
+import plotly.graph_objs as go
+import concurrent.futures
+import os
+import pickle
+from pykrx import stock as pykrx
+import numpy as np
+from scipy.optimize import minimize
+import yfinance as yf
+import requests
+import urllib3
+
+# 경고 제거
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 캐싱 설정
+cache_price = './cache/price_data.pkl'
+cache_expiry = timedelta(days=1)
+
+# 종목 코드 불러오기
+path_list = './List_KRX_KOSPI.xlsx'
+list_df = pd.read_excel(path_list)
+code_dict = dict(zip(list_df['종목코드'], list_df['종목명']))
+code = list(code_dict.keys())
+code_df = pd.DataFrame(list(code_dict.items()), columns=['종목코드', '종목명'])
+code_df['종목코드'] = code_df['종목코드'].astype(str)
+
+# 데이터 수집 함수
+def fetch_data(code, start, end):
+    try:
+        if isinstance(code, int) or code.isdigit():
+            if len(code) == 5:
+                code = '0' + code
+            df_price = pykrx.get_market_ohlcv_by_date(start, end, code)
+            if df_price is not None and '종가' in df_price.columns:
+                df_price = df_price[['종가']].rename(columns={'종가': code})
+            else:
+                return None
+        else:
+            ticker = code + ".KS"
+            yf_data = yf.Ticker(ticker)
+            info = yf_data.info
+            if 'shortName' not in info:
+                print(f"❌ {ticker} is not valid or possibly delisted")
+                return None
+            df_price = yf_data.history(start=start, end=end)['Close']
+            df_price = pd.DataFrame(df_price).rename(columns={'Close': code})
+            df_price.index = df_price.index.tz_localize(None)
+        df_price.index = pd.to_datetime(df_price.index).strftime('%Y-%m-%d')
+        return df_price.sort_index(ascending=True)
+    except Exception as e:
+        print(f"Error fetching data for {code}: {e}")
+        return None
+
+# 캐시 불러오기
+def Func(code, start, end, batch_size=10):
+    if os.path.exists(cache_price):
+        cache_mtime = datetime.fromtimestamp(os.path.getmtime(cache_price))
+        if datetime.now() - cache_mtime < cache_expiry:
+            with open(cache_price, 'rb') as f:
+                print("Loading data from cache...")
+                return pickle.load(f)
+
+    data_frames = []
+    for i in range(0, len(code), batch_size):
+        code_batch = code[i:i + batch_size]
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = {executor.submit(fetch_data, c, start, end): c for c in code_batch}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    data_frames.append(result)
+
+    price_data = pd.concat(data_frames, axis=1) if data_frames else pd.DataFrame()
+    price_data = price_data.sort_index(ascending=True)
+
+    os.makedirs(os.path.dirname(cache_price), exist_ok=True)
+    with open(cache_price, 'wb') as f:
+        pickle.dump(price_data, f)
+        print("Data cached.")
+
+    return price_data
+
+# 기간 설정
+start = (datetime.today() - relativedelta(years=1)).strftime('%Y-%m-%d')
+end = datetime.today().strftime('%Y-%m-%d')
+
+# 데이터 가져오기
+df_price = Func(code, start, end, 30)
+
+# 열 이름 변경
+def rename_column(col):
+    if col in code_df['종목코드'].values:
+        종목명 = code_df.loc[code_df['종목코드'] == col, '종목명'].values[0]
+        return f"{col} + {종목명}"
+    else:
+        return col
+
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    df_price.columns = list(executor.map(rename_column, df_price.columns))
+
+# 필터링 및 수익률 계산
+df_price = df_price[
+    df_price.columns[~df_price.columns.str.contains('레버리지|2X|3X|인버스|crypto|bitcoin|미국|TRF|TDF|글로벌|MSCI|방산|인도|200|100|채권|회사채|국공채', case=False)]
+]
+df_price = df_price.bfill().fillna(0)
+df_R = df_price.pct_change(1)
+df_cum = (1 + df_R).cumprod() - 1
+df_cum.replace([float('inf'), float('-inf')], 0, inplace=True)
+df_cum.fillna(0, inplace=True)
+if not df_cum.empty:
+    df_cum.iloc[0] = 0
+
+# 롱/숏 후보군 선정
+RR_3M = df_price.pct_change(60)
+rank = RR_3M.rank(axis=1, pct=True)
+count_win = (rank >= 0.6).sum(axis=0)
+win_prob = (count_win / rank.count()).sort_values(ascending=False)
+long_selected = df_price[win_prob.head(500).index.tolist()]
+
+RR_3M_short = df_price.pct_change(60)
+rank_short = RR_3M_short.rank(axis=1, pct=True)
+count_loss = (rank_short <= 0.4).sum(axis=0)
+loss_prob = (count_loss / rank_short.count()).sort_values(ascending=False)
+short_selected = df_price[loss_prob.head(500).index.tolist()]
+
+# 고변동성 제거
+daily_ret_short = short_selected.pct_change()
+short_selected = short_selected.drop(columns=daily_ret_short.columns[(daily_ret_short.abs() > 0.1).any()])
+daily_ret_long = long_selected.pct_change()
+long_selected = long_selected.drop(columns=daily_ret_long.columns[(daily_ret_long < -0.1).any()])
+
+# MDD 필터링
+def calculate_MDD(price):
+    roll_max = price.cummax()
+    drawdown = (price - roll_max) / roll_max
+    return drawdown.min()
+
+mdd_long = long_selected.apply(calculate_MDD)
+cut_mdd_long = mdd_long.quantile(0.25)
+long_selected = long_selected.loc[:, mdd_long > cut_mdd_long]
+
+mdd_short = short_selected.apply(calculate_MDD)
+cut_mdd_short = mdd_short.quantile(0.25)
+short_selected = short_selected.loc[:, mdd_short <= cut_mdd_short]
+
+# 페어 구성 및 포트 수익률 계산
+def generate_long_short_pairs(long_df, short_df, window=7, top_n=20):
+    long_ret = long_df.pct_change().fillna(0)
+    short_ret = short_df.pct_change().fillna(0)
+    pairs = []
+    for l in long_ret.columns:
+        for s in short_ret.columns:
+            corr_series = long_ret[l].rolling(window=window).corr(short_ret[s]).fillna(0)
+            mean_corr = corr_series.mean()
+            if pd.notnull(mean_corr):
+                pairs.append((l, s, mean_corr))
+    sorted_pairs = sorted(pairs, key=lambda x: -x[2])
+    used_longs, used_shorts, top_pairs = set(), set(), []
+    for l, s, corr in sorted_pairs:
+        if l not in used_longs and s not in used_shorts:
+            top_pairs.append((l, s, corr))
+            used_longs.add(l)
+            used_shorts.add(s)
+        if len(top_pairs) >= top_n:
+            break
+    if not top_pairs:
+        return pd.Series(dtype=float), []
+    portfolios = [(1 + long_ret[l] - short_ret[s]).cumprod() - 1 for l, s, _ in top_pairs]
+    avg_portfolio = pd.concat(portfolios, axis=1).mean(axis=1)
+    return avg_portfolio, top_pairs
+
+def calculate_rolling_return(series, window=30):
+    return series - series.shift(window)
+
+
+# Dash 앱 구성
+app = dash.Dash(__name__)
+app.title = '<Covenant> 한국주식 Long/Short Pair Model'
+
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+    html.Div([
+        html.H1("Long-Short Pair Strategy Dashboard", style={'textAlign': 'center'}),
+        dcc.Dropdown(
+            id='top-n-dropdown',
+            options=[{'label': str(n), 'value': n} for n in [5, 10, 15, 20]],
+            value=5,
+            clearable=False
+        ),
+        dcc.Graph(id='long-short-graph'),
+        dcc.Graph(id='rolling-return-graph'),
+        html.H4("Top Pair List (Long - Short, Correlation)"),
+        html.Ul(id='top-pairs-list')
+    ], style={'maxWidth': '800px', 'margin': 'auto'})
+])
+
+@app.callback(
+    Output('long-short-graph', 'figure'),
+    Output('rolling-return-graph', 'figure'),
+    Output('top-pairs-list', 'children'),
+    Input('top-n-dropdown', 'value')
+)
+def update_graph_and_list(top_n):
+    avg_portfolio, top_pairs = generate_long_short_pairs(long_selected, short_selected, window=7, top_n=top_n)
+
+    fig_cum = {
+        'data': [go.Scatter(x=avg_portfolio.index, y=avg_portfolio.values, mode='lines', name='Long-Short Portfolio')],
+        'layout': {
+            'title': {'text': f'Top {top_n} Correlated Long-Short Pair Portfolio'},
+            'xaxis': {'title': 'Date'},
+            'yaxis': {'title': 'Cumulative Return', 'tickformat': '.0%'}
+        }
+    }
+    
+    window = 30
+    rolling_return = calculate_rolling_return(avg_portfolio, window=window)
+    rolling_return = rolling_return.iloc[31:]
+
+    fig_rolling = {
+     'data': [go.Bar(x=rolling_return.index, y=rolling_return.values, name='Rolling 30D Return')],
+     'layout': {
+        'title': {'text': 'Rolling 30-Day Return (Bar)'},
+        'xaxis': {'title': 'Date'},
+        'yaxis': {'title': 'Return', 'tickformat': '.0%'}
+      }
+    }
+
+    pair_list = [html.Li(f"{l} - {s} (Corr: {c:.3f})") for l, s, c in top_pairs]
+    return fig_cum, fig_rolling, pair_list
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 8050))
+    app.run(host="0.0.0.0", port=port, debug=False)
